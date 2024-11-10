@@ -647,7 +647,7 @@ class SearchBasedCalibrator(ABC, tp.Generic[_CONFIG, _CANDIDATE]):
             eval_kwargs=eval_kwargs,
             **kwargs,
         )
-        self.logger.debug(f"+ finished reseting calibrator, ram usage: {psutil.virtual_memory().percent}")
+        self.logger.debug(f"+ finished resetting calibrator, ram usage: {psutil.virtual_memory().percent}")
         gc.collect()
         torch.cuda.empty_cache()
         if self.tensor_type == TensorType.Weights:
