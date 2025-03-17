@@ -13,6 +13,7 @@ from ...data.scale import QuantScale
 from ...data.utils import ScaleUtils
 from ...data.zero import ZeroPointDomain
 from .simple import simple_quantize
+from .mx import get_dtype_params
 
 __all__ = ["quantize_scale", "QuantScaleInfo"]
 
@@ -239,4 +240,86 @@ class QuantScaleInfo:
         assert not z.isnan().any(), "Zero point tensor contains NaN."
         assert not z.isinf().any(), "Zero point tensor contains Inf."
         # endregion
+        return s, z
+
+    def even_round(self, max_abs: torch.Tensor, mbits, emax) -> torch.Tensor:
+        f32_min_normal = 2 ** (-127 + 1)
+        eps = f32_min_normal * (max_abs == 0).type(max_abs.dtype)
+    
+        nan_mask = torch.isnan(max_abs)
+        max_abs = max_abs.to(torch.float32).view(torch.int32)
+        val_to_add = 1 << (23 - mbits - 1)
+        mask = ((1 << (8 + 1)) - 1) << 23
+        max_abs = (max_abs + val_to_add) & mask
+        max_abs = max_abs.view(torch.float32)
+        max_abs[nan_mask] = torch.tensor(float("nan"), device=max_abs.device)
+        scale_e8m0_unbiased = torch.floor(torch.log2(max_abs + eps)) - emax
+        scale_e8m0_unbiased = torch.clamp(scale_e8m0_unbiased, min=-127, max=127)
+        scale_float = torch.pow(2, scale_e8m0_unbiased)
+        return scale_float
+
+    def quantize_mx(
+        self,
+        *,
+        # scale-based quantization related arguments
+        scale: torch.Tensor | None = None,
+        zero: torch.Tensor | None = None,
+        # range-based quantization related arguments
+        tensor: torch.Tensor | None = None,
+        dynamic_range: DynamicRange | None = None,
+    ) -> tuple[QuantScale, torch.Tensor]:
+        """Get the quantization scale and zero point of the tensor to be quantized.
+
+        Args:
+            scale (`torch.Tensor` or `None`, *optional*, defaults to `None`):
+                The scale tensor.
+            zero (`torch.Tensor` or `None`, *optional*, defaults to `None`):
+                The zero point tensor.
+            tensor (`torch.Tensor` or `None`, *optional*, defaults to `None`):
+                Ten tensor to be quantized. This is only used for range-based quantization.
+            dynamic_range (`DynamicRange` or `None`, *optional*, defaults to `None`):
+                The dynamic range of the tensor to be quantized.
+
+        Returns:
+            `tuple[QuantScale, torch.Tensor]`:
+                The scale and the zero point.
+        """
+        # region step 1: get the dynamic span for range-based scale or the scale tensor
+        # breakpoint()
+        assert scale is None
+
+        assert isinstance(tensor, torch.Tensor), "View tensor must be a tensor."
+        dynamic_range = dynamic_range or DynamicRange()
+        dynamic_range = dynamic_range.measure(
+            tensor.view(self.tensor_view_shape),
+            zero_domain=self.tensor_zero_domain,
+            is_float_point=self.tensor_quant_dtype.is_float_point,
+        )
+        dynamic_range = dynamic_range.intersect(self.tensor_range_bound)
+        dynamic_span = dynamic_range.max
+
+        # endregion
+        # region step 2: get the scale
+        # breakpoint()
+        ebits, mbits, emax = get_dtype_params(self.tensor_quant_dtype.name)
+        lin_s = self.even_round(dynamic_span, mbits, emax)
+        # lin_s = torch.pow(2, torch.floor(torch.log2(dynamic_span)) - emax)
+        eps = torch.finfo(torch.float32).eps
+        lin_s = lin_s.masked_fill(lin_s == 0.0, eps)
+        lin_s = lin_s.to(torch.float32)
+        lin_s = QuantScale().append(lin_s)
+        assert lin_s.data is not None, "ufp8_e8m0_nan scale tensor is None."
+        assert not lin_s.data.isnan().any(), "ufp8_e8m0_nan scale tensor contains NaN."
+        
+        s = lin_s
+        assert s.data is not None, "Scale tensor is None."
+        assert not s.data.isnan().any(), "Scale tensor contains NaN."
+        assert not s.data.isinf().any(), "Scale tensor contains Inf."
+        # endregion
+        # region step 3: get the zero point
+        z = torch.tensor(0, dtype=s.data.dtype, device=s.data.device)
+        assert not z.isnan().any(), "Zero point tensor contains NaN."
+        assert not z.isinf().any(), "Zero point tensor contains Inf."
+        # endregion
+        # breakpoint()
         return s, z
