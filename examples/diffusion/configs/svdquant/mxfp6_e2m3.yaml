@@ -1,0 +1,22 @@
+quant:
+  wgts:
+    dtype: sfp6_e2m3_all
+    group_shapes:
+    - - 1
+      - 32
+      - 1
+      - 1
+      - 1
+    scale_dtypes:
+    - ufp8_e8m0_nan
+  ipts:
+    static: false
+    dtype: sfp6_e2m3_all
+    group_shapes:
+    - - 1
+      - 32 # tensor_view_shape
+      - 1
+      - 1
+      - 1
+    scale_dtypes:
+    - ufp8_e8m0_nan

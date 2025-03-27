@@ -108,7 +108,8 @@ class QuantizerImpl:
         round_delta = kwargs.pop("round_delta", None)
         if round_delta is not None:
             round_delta = round_delta.view(-1, *shape[channels_dim:])
-        result = self._quantize(
+        if hasattr(self.config.dtype, "name") and self.config.dtype.name in ["sfp4_e2m1_all", "sfp6_e2m3_all", "sfp6_e3m2_all"] and self.config.scale_dtypes[0].name in ["ufp8_e8m0_nan"]:
+            result = self._quantize_mx(
             tensor,
             kernel=kernel,
             scale=scale,
@@ -122,7 +123,23 @@ class QuantizerImpl:
             default_dtype=default_dtype or tensor.dtype,
             develop_dtype=develop_dtype,
             **kwargs,
-        )
+            )
+        else:
+            result = self._quantize(
+                tensor,
+                kernel=kernel,
+                scale=scale,
+                zero=zero,
+                dynamic_range=dynamic_range,
+                range_bound=range_bound,
+                quant_range=quant_range,
+                round_delta=round_delta,
+                return_with_dequant=return_with_dequant,
+                return_with_quant=return_with_quant,
+                default_dtype=default_dtype or tensor.dtype,
+                develop_dtype=develop_dtype,
+                **kwargs,
+            )
         if result.data is not None:
             result._dequantized = result.data.view(shape)
         if result.qdata is not None:
@@ -321,3 +338,109 @@ class QuantizerImpl:
                     config, tensor_shape, default_dtype, quant_range=quant_range, range_bound=range_bound
                 )
         return self.info
+
+    def _quantize_mx(  # noqa: C901
+        self,
+        tensor: torch.Tensor,
+        *,
+        kernel: BaseQuantKernel | BaseQuantKernelConfig | None = None,
+        # scale-based quantization arguments
+        scale: torch.Tensor | tp.Sequence[torch.Tensor | None] | None = None,
+        zero: torch.Tensor | None = None,
+        # range-based quantization arguments
+        dynamic_range: DynamicRange | tp.Sequence[DynamicRange | None] | None = None,
+        # other arguments
+        range_bound: RangeBound | None = None,
+        quant_range: QuantRange | None = None,
+        round_delta: torch.Tensor | None = None,
+        return_with_dequant: bool = True,
+        return_with_quant: bool = False,
+        default_dtype: torch.dtype = torch.float16,
+        develop_dtype: torch.dtype = torch.float32,
+        **kwargs,
+    ) -> QuantTensor:
+        """Quantize a floating point tensor.
+
+        Args:
+            tensor (`torch.Tensor`):
+                The floating-point tensor to be quantized.
+            kernel (`QuantKernel` or `QuantKernelConfig` or `None`, *optional*, defaults to `None`):
+                The quantization kernel or its configuration.
+            scale (`torch.Tensor` or `Sequence[torch.Tensor]` or `None`, *optional*, defaults to `None`):
+                The scale tensor.
+            zero (`torch.Tensor` or `None`, *optional*, defaults to `None`):
+                The zero point tensor.
+            dynamic_range (`DynamicRange` or `Sequence[DynamicRange]` or `None`, *optional*, defaults to `None`):
+                The dynamic range.
+            range_bound (`RangeBound` or `None`, *optional*, defaults to `None`):
+                The dynamic range bound.
+            quant_range (`QuantRange` or `None`, *optional*, defaults to `None`):
+                The quantization range.
+            return_with_dequant (`bool`, *optional*, defaults to `True`):
+                Whether to return with dequantized tensor.
+            return_with_quant (`bool`, *optional*, defaults to `False`):
+                Whether to return with quantized tensor.
+            default_dtype (`torch.dtype`, *optional*, defaults to `torch.float16`):
+                The default dtype for scale.
+            develop_dtype (`torch.dtype`, *optional*, defaults to `torch.float32`):
+                The develop dtype.
+            **kwargs:
+                Other keyword arguments for the quantization kernel. For example,
+                ``inputs`` for the input tensors in GPTQ kernel,
+                ``round_delta`` for the rounding delta in the RTN kernel.
+
+        Returns:
+            `QuantTensor`:
+                The quantized tensor.
+        """
+        shape, dtype = tensor.shape, tensor.dtype
+        self.update(shape, default_dtype, quant_range, range_bound)
+        if self.info is None or self.info.num_steps == 0:
+            return QuantTensor(dequantized=tensor, quantized=tensor, view_shape=shape)
+        assert self.info.num_steps == 1
+        # region compute and quantize the scales and zero point for quantization
+        quant_scale = QuantScale()
+        develop_tensor = tensor.to(dtype=develop_dtype) if dtype != develop_dtype else tensor.clone()
+
+        step_scale, step_zero = self.info.steps[0].scale.quantize_mx(
+            scale=scale,
+            zero=None,
+            tensor=develop_tensor,
+            dynamic_range=dynamic_range,
+        )
+        quant_scale.append(step_scale)
+        quant_zero = step_zero
+        # endregion
+        # region quantize the tensor
+        assert isinstance(step_scale, QuantScale), "The last scale must be a QuantScale."
+        assert isinstance(step_zero, torch.Tensor), "The last zero point must be a tensor."
+
+        assert not develop_tensor.isnan().any(), "Quantized tensor contains NaN."
+        assert not develop_tensor.isinf().any(), "Quantized tensor contains Inf."
+        # endregion
+        # region update the quantized tensor
+        quantized = None
+
+        # endregion
+        # region update the dequantized tensor
+
+        assert return_with_dequant
+
+        from .mx import fake_quantize_mx
+
+        develop_tensor = develop_tensor.reshape(self.info.steps[-1].tensor_view_shape)
+        
+        quantized = fake_quantize_mx(develop_tensor, step_scale.data, self.config.dtype.name)
+
+        dequantized  = quantized * step_scale.data
+
+        dequantized = dequantized.view(shape).to(dtype=dtype)
+
+        # endregion
+        return QuantTensor(
+            dequantized=dequantized,
+            quantized=quantized,
+            scale=quant_scale if return_with_quant else None,
+            zero=quant_zero if return_with_quant else None,
+            view_shape=self.info.steps[-1].tensor_view_shape if return_with_quant else None,
+        )
